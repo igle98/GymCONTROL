@@ -6,12 +6,13 @@ import {
   deleteRoutine,
 } from '../services/routines.js';
 import { getExercises } from '../services/exercises.js';
+import { MUSCLE_GROUPS } from '../utils/constants.js';
 
 export async function renderRoutines(container) {
   container.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
       <h1 style="margin-bottom:0">Rutinas</h1>
-      <button class="btn btn-primary btn-sm" id="btn-add-routine">+ Nueva</button>
+      <button class="btn btn-primary btn-sm" id="btn-add-routine" disabled>+ Nueva</button>
     </div>
     <div id="routines-list"><div class="spinner"></div></div>
     <div id="routine-modal-container"></div>
@@ -24,6 +25,7 @@ export async function renderRoutines(container) {
   async function load() {
     const [routines, exercises] = await Promise.all([getRoutines(), getExercises()]);
     allExercises = exercises;
+    container.querySelector('#btn-add-routine').disabled = false;
     const exerciseMap = Object.fromEntries(exercises.map((e) => [e.id, e]));
 
     if (routines.length === 0) {
@@ -97,6 +99,15 @@ export async function renderRoutines(container) {
 
   function showRoutineModal(existing = null) {
     const days = existing?.days ? JSON.parse(JSON.stringify(existing.days)) : [{ dayName: '', exercises: [] }];
+    // Per-day muscle group filter state
+    const dayGroupFilters = days.map(() => '');
+
+    function getFilteredExercises(dayIdx) {
+      const group = dayGroupFilters[dayIdx];
+      return allExercises
+        .filter((e) => !(days[dayIdx].exercises || []).includes(e.id))
+        .filter((e) => !group || e.muscleGroup === group);
+    }
 
     function renderModal() {
       modalContainer.innerHTML = `
@@ -134,11 +145,16 @@ export async function renderRoutines(container) {
                       })
                       .join('')}
                   </div>
+                  <select class="select mt-8 muscle-group-filter" data-day-index="${i}">
+                    <option value="">Filtrar por grupo muscular...</option>
+                    ${MUSCLE_GROUPS.map(
+                      (g) => `<option value="${g}" ${dayGroupFilters[i] === g ? 'selected' : ''}>${g}</option>`
+                    ).join('')}
+                  </select>
                   <select class="select mt-8 add-exercise-select" data-day-index="${i}">
                     <option value="">+ Añadir ejercicio...</option>
-                    ${allExercises
-                      .filter((e) => !(day.exercises || []).includes(e.id))
-                      .map((e) => `<option value="${e.id}">${e.name} (${e.muscleGroup})</option>`)
+                    ${getFilteredExercises(i)
+                      .map((e) => `<option value="${e.id}">${e.name}</option>`)
                       .join('')}
                   </select>
                 </div>
@@ -163,7 +179,9 @@ export async function renderRoutines(container) {
       // Remove day
       modalContainer.querySelectorAll('.remove-day-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
-          days.splice(parseInt(btn.dataset.index, 10), 1);
+          const idx = parseInt(btn.dataset.index, 10);
+          days.splice(idx, 1);
+          dayGroupFilters.splice(idx, 1);
           renderModal();
         });
       });
@@ -174,6 +192,22 @@ export async function renderRoutines(container) {
           const dayIdx = parseInt(btn.dataset.day, 10);
           days[dayIdx].exercises = days[dayIdx].exercises.filter((id) => id !== btn.dataset.ex);
           renderModal();
+        });
+      });
+
+      // Muscle group filter — update exercise options in-place without full re-render
+      modalContainer.querySelectorAll('.muscle-group-filter').forEach((sel) => {
+        sel.addEventListener('change', () => {
+          const dayIdx = parseInt(sel.dataset.dayIndex, 10);
+          dayGroupFilters[dayIdx] = sel.value;
+          const exerciseSelect = modalContainer.querySelector(
+            `.add-exercise-select[data-day-index="${dayIdx}"]`
+          );
+          exerciseSelect.innerHTML =
+            `<option value="">+ Añadir ejercicio...</option>` +
+            getFilteredExercises(dayIdx)
+              .map((e) => `<option value="${e.id}">${e.name}</option>`)
+              .join('');
         });
       });
 
@@ -199,6 +233,7 @@ export async function renderRoutines(container) {
       // Add day
       modalContainer.querySelector('#add-day-btn').addEventListener('click', () => {
         days.push({ dayName: '', exercises: [] });
+        dayGroupFilters.push('');
         renderModal();
       });
 
