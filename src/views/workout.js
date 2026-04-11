@@ -17,8 +17,10 @@ export async function renderWorkout(container) {
   const routineId = params.get('routine');
   const dayIndex = parseInt(params.get('day'), 10);
 
+  // Tapping the "Entrenar" tab lands here without params — send the user
+  // back to the day picker on the dashboard instead of showing an error.
   if (!routineId || isNaN(dayIndex)) {
-    container.innerHTML = '<p class="text-warning">Parámetros inválidos</p>';
+    navigate('/');
     return;
   }
 

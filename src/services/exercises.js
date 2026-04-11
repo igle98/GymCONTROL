@@ -6,7 +6,6 @@ import {
   deleteDoc,
   getDocs,
   query,
-  where,
   orderBy,
   Timestamp,
 } from 'firebase/firestore';
@@ -18,25 +17,18 @@ function exercisesRef() {
 }
 
 export async function getExercises(onlyActive = true) {
-  let q;
-  if (onlyActive) {
-    q = query(exercisesRef(), where('isActive', '==', true), orderBy('name'));
-  } else {
-    q = query(exercisesRef(), orderBy('name'));
-  }
+  // Fetch ordered by name only, then filter client-side to avoid needing a
+  // composite Firestore index on (isActive, name).
+  const q = query(exercisesRef(), orderBy('name'));
   const snapshot = await getDocs(q);
-  return snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const all = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+  return onlyActive ? all.filter((e) => e.isActive !== false) : all;
 }
 
 export async function getExercisesByGroup(muscleGroup) {
-  const q = query(
-    exercisesRef(),
-    where('isActive', '==', true),
-    where('muscleGroup', '==', muscleGroup),
-    orderBy('name')
-  );
-  const snapshot = await getDocs(q);
-  return snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
+  // Same rationale as getExercises: filter client-side to skip composite index.
+  const all = await getExercises(true);
+  return all.filter((e) => e.muscleGroup === muscleGroup);
 }
 
 export async function addExercise(exercise) {
