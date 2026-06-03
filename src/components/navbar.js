@@ -33,7 +33,7 @@ export function renderNavbar() {
 }
 
 function updateActiveTab() {
-  const currentPath = window.location.hash.slice(1) || '/';
+  const currentPath = (window.location.hash.slice(1) || '/').split('?')[0];
   document.querySelectorAll('.nav-tab').forEach((tab) => {
     tab.classList.toggle('active', tab.dataset.path === currentPath);
   });

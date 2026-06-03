@@ -14,7 +14,9 @@ export function getCurrentRoute() {
 }
 
 async function handleRouteChange() {
-  const path = getCurrentRoute();
+  // Routes are registered without query strings, so strip everything after
+  // "?" before looking up the handler (e.g. "/workout?routine=x&day=0").
+  const path = getCurrentRoute().split('?')[0];
   const container = document.getElementById('view-container');
   const renderFn = routes[path] || routes['/'];
 

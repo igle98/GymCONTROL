@@ -6,22 +6,63 @@ import { calculateWarmup, estimate1RM } from '../utils/calculations.js';
 import { formatWeight, formatDate, formatDuration } from '../utils/formatters.js';
 import { showRestTimer } from '../components/rest-timer.js';
 import { navigate } from '../components/router.js';
-import { DEFAULT_REST_TIME } from '../utils/constants.js';
+import { DEFAULT_REST_TIME, MUSCLE_GROUPS } from '../utils/constants.js';
 import { Timestamp } from 'firebase/firestore';
 
-let sessionStartTime = null;
 let sessionTimer = null;
+
+// In-memory active session so the user can leave the workout (e.g. tap another
+// tab) and resume it from "Entrenar" without losing entered sets. Cleared when
+// the session is saved or explicitly discarded.
+let activeSession = null;
+
+// Rendering context for the current workout, used by re-render triggers
+// (add set, swap exercise) so they don't need to re-fetch everything.
+let ctx = null;
+
+export function getActiveSession() {
+  return activeSession;
+}
+
+function clearActiveSession() {
+  activeSession = null;
+}
+
+// Build the initial set rows for an exercise from its previous session data.
+function buildSetsForExercise(prev, suggestion) {
+  const numSets = prev ? prev.sets.filter((s) => s.type !== 'warmup').length : 3;
+  return Array.from({ length: numSets }, (_, i) => ({
+    setNumber: i + 1,
+    weight:
+      suggestion?.weight ||
+      (prev ? prev.sets.find((s) => s.type !== 'warmup')?.weight : '') ||
+      '',
+    reps: '',
+    type: 'working',
+    completed: false,
+  }));
+}
+
+async function loadExerciseData(exId) {
+  const prev = await getLastSessionForExercise(exId);
+  return { prev, suggestion: prev ? getWeightSuggestion(prev.sets) : null };
+}
 
 export async function renderWorkout(container) {
   const params = new URLSearchParams(window.location.hash.split('?')[1] || '');
-  const routineId = params.get('routine');
-  const dayIndex = parseInt(params.get('day'), 10);
+  let routineId = params.get('routine');
+  let dayIndex = parseInt(params.get('day'), 10);
 
-  // Tapping the "Entrenar" tab lands here without params — send the user
-  // back to the day picker on the dashboard instead of showing an error.
+  // Tapping the "Entrenar" tab lands here without params. Resume the active
+  // session if there is one; otherwise send the user to the day picker.
   if (!routineId || isNaN(dayIndex)) {
-    navigate('/');
-    return;
+    if (activeSession) {
+      routineId = activeSession.routineId;
+      dayIndex = activeSession.dayIndex;
+    } else {
+      navigate('/');
+      return;
+    }
   }
 
   container.innerHTML = '<div class="spinner"></div>';
@@ -36,49 +77,72 @@ export async function renderWorkout(container) {
   const allExercises = await getExercises(false);
   const exerciseMap = Object.fromEntries(allExercises.map((e) => [e.id, e]));
 
-  // Load previous session data for each exercise
+  const resuming =
+    activeSession &&
+    activeSession.routineId === routineId &&
+    activeSession.dayIndex === dayIndex;
+
+  // Switching to a different day while a session is in progress would discard it.
+  if (activeSession && !resuming) {
+    if (!confirm('Tienes un entreno en curso. ¿Descartarlo y empezar este día?')) {
+      navigate('/workout?routine=' + activeSession.routineId + '&day=' + activeSession.dayIndex);
+      return;
+    }
+    clearActiveSession();
+  }
+
   const previousData = {};
   const suggestions = {};
-  for (const exId of day.exercises || []) {
-    const prev = await getLastSessionForExercise(exId);
-    if (prev) {
-      previousData[exId] = prev;
-      suggestions[exId] = getWeightSuggestion(prev.sets);
+
+  if (!resuming) {
+    // Fresh session: load previous data and seed sets for each exercise.
+    const sessionState = {
+      routineId,
+      dayIndex,
+      dayName: day.dayName,
+      order: [...(day.exercises || [])],
+      exercises: {},
+    };
+
+    for (const exId of sessionState.order) {
+      const { prev, suggestion } = await loadExerciseData(exId);
+      if (prev) {
+        previousData[exId] = prev;
+        suggestions[exId] = suggestion;
+      }
+      sessionState.exercises[exId] = { sets: buildSetsForExercise(prev, suggestion) };
+    }
+
+    activeSession = sessionState;
+    activeSession.startTime = Date.now();
+  } else {
+    // Resuming: reload previous-session data for display only; keep entered sets.
+    for (const exId of activeSession.order) {
+      const { prev, suggestion } = await loadExerciseData(exId);
+      if (prev) {
+        previousData[exId] = prev;
+        suggestions[exId] = suggestion;
+      }
     }
   }
 
-  // Build session state
-  const sessionState = {
-    routineId,
-    dayName: day.dayName,
-    exercises: {},
-  };
-
-  for (const exId of day.exercises || []) {
-    const prev = previousData[exId];
-    const numSets = prev ? prev.sets.filter((s) => s.type !== 'warmup').length : 3;
-    sessionState.exercises[exId] = {
-      sets: Array.from({ length: numSets }, (_, i) => ({
-        setNumber: i + 1,
-        weight: suggestions[exId]?.weight || (prev ? prev.sets.find((s) => s.type !== 'warmup')?.weight : '') || '',
-        reps: '',
-        type: 'working',
-        completed: false,
-      })),
-    };
-  }
-
-  sessionStartTime = Date.now();
-  renderWorkoutUI(container, day, exerciseMap, previousData, suggestions, sessionState, routineId);
+  ctx = { container, day, exerciseMap, previousData, suggestions, allExercises };
+  renderWorkoutUI();
 }
 
-function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions, sessionState, routineId) {
-  let elapsed = 0;
+function rerender() {
+  clearInterval(sessionTimer);
+  renderWorkoutUI();
+}
+
+function renderWorkoutUI() {
+  const { container, exerciseMap, previousData, suggestions } = ctx;
+  const sessionState = activeSession;
 
   let html = `
     <div class="workout-header">
       <div>
-        <h1>${day.dayName}</h1>
+        <h1>${sessionState.dayName}</h1>
         <p class="text-muted" style="font-size:0.85rem">${new Date().toLocaleDateString('es-ES', { weekday: 'long', day: 'numeric', month: 'long' })}</p>
       </div>
       <button class="btn btn-ghost" id="btn-back">✕</button>
@@ -89,7 +153,7 @@ function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions,
     </div>
   `;
 
-  for (const exId of Object.keys(sessionState.exercises)) {
+  for (const exId of sessionState.order) {
     const ex = exerciseMap[exId];
     if (!ex) continue;
 
@@ -103,7 +167,10 @@ function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions,
       <div class="exercise-block" data-exercise-id="${exId}">
         <div class="exercise-block-header">
           <h3>${ex.name}</h3>
-          <span class="badge badge-muted">${ex.muscleGroup}</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="badge badge-muted">${ex.muscleGroup}</span>
+            <button class="btn-ghost btn-sm swap-exercise-btn" data-exercise-id="${exId}" title="Cambiar ejercicio">⇄</button>
+          </div>
         </div>
     `;
 
@@ -172,21 +239,24 @@ function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions,
       </div>
       <button class="btn btn-primary btn-block" id="btn-save-session">Guardar sesión</button>
     </div>
+    <div id="workout-modal-container"></div>
   `;
 
   container.innerHTML = html;
 
-  // Session timer
-  sessionTimer = setInterval(() => {
-    elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+  // Session timer (anchored to the session start so it survives re-renders)
+  const updateElapsed = () => {
     const el = container.querySelector('#session-elapsed');
-    if (el) el.textContent = formatDuration(elapsed);
-  }, 1000);
+    if (el) el.textContent = formatDuration(Math.floor((Date.now() - sessionState.startTime) / 1000));
+  };
+  updateElapsed();
+  sessionTimer = setInterval(updateElapsed, 1000);
 
-  // Event: back button
+  // Event: back button (discards the active session)
   container.querySelector('#btn-back').addEventListener('click', () => {
-    if (confirm('¿Salir sin guardar?')) {
+    if (confirm('¿Salir sin guardar? Se perderá el entreno en curso.')) {
       clearInterval(sessionTimer);
+      clearActiveSession();
       navigate('/');
     }
   });
@@ -247,21 +317,30 @@ function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions,
         type: 'working',
         completed: false,
       });
-      // Re-render
-      clearInterval(sessionTimer);
       const currentNotes = container.querySelector('#session-notes')?.value || '';
-      renderWorkoutUI(container, { dayName: container.querySelector('h1').textContent, exercises: Object.keys(sessionState.exercises) },
-        Object.fromEntries(Object.keys(sessionState.exercises).map(id => [id, { id, name: container.querySelector(`[data-exercise-id="${id}"] h3`)?.textContent || '', muscleGroup: '' }])),
-        {}, {}, sessionState, routineId);
-      const notesField = container.querySelector('#session-notes');
-      if (notesField) notesField.value = currentNotes;
+      sessionState.notes = currentNotes;
+      rerender();
     });
   });
+
+  // Event: swap exercise (machine occupied → substitute, this session only)
+  container.querySelectorAll('.swap-exercise-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      sessionState.notes = container.querySelector('#session-notes')?.value || '';
+      showSwapModal(btn.dataset.exerciseId);
+    });
+  });
+
+  // Restore notes after a re-render
+  if (sessionState.notes) {
+    const notesField = container.querySelector('#session-notes');
+    if (notesField) notesField.value = sessionState.notes;
+  }
 
   // Event: save session
   container.querySelector('#btn-save-session').addEventListener('click', async () => {
     clearInterval(sessionTimer);
-    const duration = Math.floor((Date.now() - sessionStartTime) / 1000);
+    const duration = Math.floor((Date.now() - sessionState.startTime) / 1000);
     const notes = container.querySelector('#session-notes')?.value || '';
 
     const allSets = [];
@@ -291,16 +370,19 @@ function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions,
 
       await saveSession({
         date: Timestamp.now(),
-        routineId,
+        routineId: sessionState.routineId,
         dayName: sessionState.dayName,
         sets: allSets,
         notes,
         duration,
       });
 
+      clearActiveSession();
       navigate('/');
     } catch (err) {
       alert('Error al guardar: ' + err.message);
+      const b = container.querySelector('#btn-save-session');
+      if (b) { b.disabled = false; b.textContent = 'Guardar sesión'; }
     }
   });
 
@@ -309,4 +391,99 @@ function renderWorkoutUI(container, day, exerciseMap, previousData, suggestions,
       clearInterval(sessionTimer);
     },
   };
+}
+
+// Modal to substitute an exercise for another, just for the current session.
+// Defaults the filter to the same muscle group so the swap is quick.
+function showSwapModal(oldId) {
+  const { container, exerciseMap, allExercises } = ctx;
+  const sessionState = activeSession;
+  const oldEx = exerciseMap[oldId];
+  const modalContainer = container.querySelector('#workout-modal-container');
+  let groupFilter = oldEx?.muscleGroup || '';
+
+  function candidates() {
+    return allExercises
+      .filter((e) => e.isActive !== false)
+      .filter((e) => e.id === oldId || !sessionState.order.includes(e.id))
+      .filter((e) => e.id !== oldId)
+      .filter((e) => !groupFilter || e.muscleGroup === groupFilter);
+  }
+
+  function render() {
+    modalContainer.innerHTML = `
+      <div class="modal-backdrop" id="swap-modal">
+        <div class="modal">
+          <div class="modal-header">
+            <h2>Cambiar ejercicio</h2>
+            <button class="btn-ghost" id="swap-close">✕</button>
+          </div>
+          <p class="text-muted" style="font-size:0.85rem;margin-bottom:12px">
+            Sustituye <strong>${oldEx?.name || ''}</strong> solo para este entreno. La rutina no cambia.
+          </p>
+          <div class="input-group">
+            <label>Grupo muscular</label>
+            <select class="select" id="swap-group">
+              <option value="">Todos los grupos</option>
+              ${MUSCLE_GROUPS.map(
+                (g) => `<option value="${g}" ${groupFilter === g ? 'selected' : ''}>${g}</option>`
+              ).join('')}
+            </select>
+          </div>
+          <div class="input-group">
+            <label>Ejercicio</label>
+            <select class="select" id="swap-exercise">
+              <option value="">Selecciona...</option>
+              ${candidates()
+                .map((e) => `<option value="${e.id}">${e.name} (${e.muscleGroup})</option>`)
+                .join('')}
+            </select>
+          </div>
+          <button class="btn btn-primary btn-block mt-8" id="swap-confirm" disabled>Sustituir</button>
+        </div>
+      </div>
+    `;
+
+    const close = () => (modalContainer.innerHTML = '');
+    modalContainer.querySelector('#swap-close').addEventListener('click', close);
+    modalContainer.querySelector('.modal-backdrop').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) close();
+    });
+
+    modalContainer.querySelector('#swap-group').addEventListener('change', (e) => {
+      groupFilter = e.target.value;
+      render();
+    });
+
+    const exSelect = modalContainer.querySelector('#swap-exercise');
+    const confirmBtn = modalContainer.querySelector('#swap-confirm');
+    exSelect.addEventListener('change', () => {
+      confirmBtn.disabled = !exSelect.value;
+    });
+
+    confirmBtn.addEventListener('click', async () => {
+      const newId = exSelect.value;
+      if (!newId) return;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Cambiando...';
+
+      // Load suggestion/previous data for the replacement and seed its sets.
+      const { prev, suggestion } = await loadExerciseData(newId);
+      if (prev) {
+        ctx.previousData[newId] = prev;
+        ctx.suggestions[newId] = suggestion;
+      }
+
+      const idx = sessionState.order.indexOf(oldId);
+      if (idx !== -1) sessionState.order[idx] = newId;
+      delete sessionState.exercises[oldId];
+      sessionState.exercises[newId] = { sets: buildSetsForExercise(prev, suggestion) };
+
+      sessionState.notes = container.querySelector('#session-notes')?.value || sessionState.notes || '';
+      close();
+      rerender();
+    });
+  }
+
+  render();
 }
